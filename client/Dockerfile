@@ -46,7 +46,7 @@ RUN chmod -R 755 /var/run
 RUN chmod -R 755 /var/log/nginx
 
 # Switch to non-root user
-USER nodejs
+#USER nodejs
 
 # Expose port
 EXPOSE 80
