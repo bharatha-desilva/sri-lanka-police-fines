@@ -1,0 +1,31 @@
+{
+  "name": "sri-lanka-police-fine-system",
+  "version": "1.0.0",
+  "description": "MERN stack application for Sri Lankan Police Traffic Fine Management System",
+  "main": "server/index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "cd server && npm run dev",
+    "client": "cd client && npm start",
+    "build": "cd client && npm run build",
+    "install-server": "cd server && npm install",
+    "install-client": "cd client && npm install",
+    "install-all": "npm run install-server && npm run install-client",
+    "docker:build": "docker-compose build",
+    "docker:up": "docker-compose up",
+    "docker:down": "docker-compose down"
+  },
+  "keywords": [
+    "mern",
+    "police",
+    "traffic-fines",
+    "sri-lanka",
+    "aws",
+    "docker"
+  ],
+  "author": "Sri Lanka Police Department",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
