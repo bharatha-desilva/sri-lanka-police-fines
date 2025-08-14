@@ -96,58 +96,75 @@ if (-not $HasProvider) {
   aws iam create-open-id-connect-provider --url $OidcUrl --client-id-list "sts.amazonaws.com" --thumbprint-list $Thumbprint | Out-Null
 }
 
-# -------- IAM: ECS task execution role --------
+# --- Create/Get ecsTaskExecutionRole and attach policy ---
 $TaskExecRoleName = "ecsTaskExecutionRole"
 $TaskExecRoleArn = $null
 try {
-  $role = aws iam get-role --role-name $TaskExecRoleName | ConvertFrom-Json
-  $TaskExecRoleArn = $role.Role.Arn
-} catch {
-  $TrustEcs = @{
-    Version = "2012-10-17"
-    Statement = @(@{ Effect = "Allow"; Principal = @{ Service = "ecs-tasks.amazonaws.com" }; Action = "sts:AssumeRole" })
-  } | ConvertTo-Json -Depth 5
-  $role = aws iam create-role --role-name $TaskExecRoleName --assume-role-policy-document $TrustEcs | ConvertFrom-Json
-  $TaskExecRoleArn = $role.Role.Arn
+  $TaskExecRoleArn = aws iam get-role --role-name $TaskExecRoleName --query "Role.Arn" --output text 2>$null
+}
+catch { $TaskExecRoleArn = $null }
+
+if (-not $TaskExecRoleArn -or $TaskExecRoleArn -eq "None") {
+  $trustJson = @"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Principal": { "Service": "ecs-tasks.amazonaws.com" }, "Action": "sts:AssumeRole" }
+  ]
+}
+"@
+  $trustFile = New-TemporaryFile
+  $trustJson | Set-Content -Path $trustFile -Encoding ascii
+  aws iam create-role --role-name $TaskExecRoleName --assume-role-policy-document file://$trustFile | Out-Null
   aws iam attach-role-policy --role-name $TaskExecRoleName --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy | Out-Null
+  # if pulling private GHCR, allow Secrets Manager read
+  if ($UsePrivateGhcr -match '^(Y|y)') {
+    aws iam attach-role-policy --role-name $TaskExecRoleName --policy-arn arn:aws:iam::aws:policy/SecretsManagerReadWrite | Out-Null
+  }
+  $TaskExecRoleArn = aws iam get-role --role-name $TaskExecRoleName --query "Role.Arn" --output text
 }
-if ($UsePrivateGhcr -match '^(Y|y)') {
-  try { aws iam attach-role-policy --role-name $TaskExecRoleName --policy-arn arn:aws:iam::aws:policy/SecretsManagerReadWrite | Out-Null } catch { }
-}
+if (-not $TaskExecRoleArn -or $TaskExecRoleArn -eq "None") { throw "ecsTaskExecutionRole creation failed" }
 
 # -------- IAM: GitHub OIDC role for deployments --------
 $GhOidcRoleName = "GitHubActionsECSDeployRole"
 $GhOidcRoleArn = $null
 $SubCondition = "repo:$GitHubOwner/$GitHubRepo:ref:$BranchRef"
 $TrustPolicy = @{
-  Version = "2012-10-17"
+  Version   = "2012-10-17"
   Statement = @(@{
-    Effect = "Allow"
-    Principal = @{ Federated = "arn:aws:iam::$AccountId:oidc-provider/token.actions.githubusercontent.com" }
-    Action = "sts:AssumeRoleWithWebIdentity"
-    Condition = @{
-      "StringEquals" = @{ "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com" }
-      "StringLike" = @{ "token.actions.githubusercontent.com:sub" = $SubCondition }
-    }
-  })
+      Effect    = "Allow"
+      Principal = @{ Federated = "arn:aws:iam::$AccountId:oidc-provider/token.actions.githubusercontent.com" }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = @{
+        "StringEquals" = @{ "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com" }
+        "StringLike"   = @{ "token.actions.githubusercontent.com:sub" = $SubCondition }
+      }
+    })
 } | ConvertTo-Json -Depth 10
 
 try {
   $role = aws iam get-role --role-name $GhOidcRoleName | ConvertFrom-Json
   $GhOidcRoleArn = $role.Role.Arn
-} catch {
+}
+catch {
   $role = aws iam create-role --role-name $GhOidcRoleName --assume-role-policy-document $TrustPolicy | ConvertFrom-Json
   $GhOidcRoleArn = $role.Role.Arn
 }
+
+# --- Inline policy for GitHub deploy role (after TaskExecRoleArn is known) ---
 $DeployPolicyName = "GitHubEcsDeployPolicy"
-$DeployPolicyDoc = @{
-  Version = "2012-10-17"
-  Statement = @(
-    @{ Effect = "Allow"; Action = @("ecs:UpdateService","ecs:DescribeServices","ecs:DescribeClusters","ecs:DescribeTaskDefinition","ecs:ListServices"); Resource = "*" },
-    @{ Effect = "Allow"; Action = "iam:PassRole"; Resource = $TaskExecRoleArn }
-  )
-} | ConvertTo-Json -Depth 10
-aws iam put-role-policy --role-name $GhOidcRoleName --policy-name $DeployPolicyName --policy-document $DeployPolicyDoc | Out-Null
+$DeployPolicyDoc = @"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": ["ecs:UpdateService","ecs:DescribeServices","ecs:DescribeClusters","ecs:DescribeTaskDefinition","ecs:ListServices"], "Resource": "*" },
+    { "Effect": "Allow", "Action": "iam:PassRole", "Resource": "$TaskExecRoleArn" }
+  ]
+}
+"@
+$policyFile = New-TemporaryFile
+$DeployPolicyDoc | Set-Content -Path $policyFile -Encoding ascii
+aws iam put-role-policy --role-name $GhOidcRoleName --policy-name $DeployPolicyName --policy-document file://$policyFile | Out-Null
 
 # -------- Optional: store GHCR PAT for private pulls --------
 $RepoCredsSecretArn = $null
@@ -162,7 +179,8 @@ if ($UsePrivateGhcr -match '^(Y|y)') {
   if ($existing.SecretList -and $existing.SecretList.Count -gt 0) {
     $RepoCredsSecretArn = $existing.SecretList[0].ARN
     aws secretsmanager update-secret --secret-id $RepoCredsSecretArn --secret-string $GitHubPATPlain | Out-Null
-  } else {
+  }
+  else {
     $created = aws secretsmanager create-secret --name $SecretName --secret-string $GitHubPATPlain | ConvertFrom-Json
     $RepoCredsSecretArn = $created.ARN
   }
@@ -187,7 +205,8 @@ if (-not $AlbArn) {
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($albCreateJson)) {
     Write-Warning "ALB creation failed or not permitted in this account/region. Falling back to no-ALB mode."
     $UseAlb = $false
-  } else {
+  }
+  else {
     $created = $albCreateJson | ConvertFrom-Json
     $AlbArn = $created.LoadBalancers[0].LoadBalancerArn
     $AlbDns = $created.LoadBalancers[0].DNSName
@@ -210,10 +229,10 @@ function Ensure-TG {
 
 if ($UseAlb) {
   $TgFrontendArn = Ensure-TG -Name "$BaseName-frontend-tg" -Port 80   -HealthPath "/"
-  $TgBackendArn  = Ensure-TG -Name "$BaseName-backend-tg"  -Port 5000 -HealthPath "/health"
+  $TgBackendArn = Ensure-TG -Name "$BaseName-backend-tg"  -Port 5000 -HealthPath "/health"
 
   if (-not $TgFrontendArn) { throw "Frontend TG ARN is empty" }
-  if (-not $TgBackendArn)  { throw "Backend TG ARN is empty" }
+  if (-not $TgBackendArn) { throw "Backend TG ARN is empty" }
 
   $Listeners = aws elbv2 describe-listeners --load-balancer-arn $AlbArn 2>$null | ConvertFrom-Json
   $ListenerArn = $null
@@ -228,7 +247,8 @@ if ($UseAlb) {
     }
     $createdL = $createListenerJson | ConvertFrom-Json
     $ListenerArn = $createdL.Listeners[0].ListenerArn
-  } else {
+  }
+  else {
     aws elbv2 modify-listener --listener-arn $ListenerArn --default-actions $defaultActions | Out-Null
   }
 
@@ -241,7 +261,7 @@ if ($UseAlb) {
   }
   if (-not $HasApiRule) {
     $conditions = @(@{ Field = "path-pattern"; Values = @("/api*") }) | ConvertTo-Json -Compress
-    $actions    = @(@{ Type = "forward"; TargetGroupArn = $TgBackendArn }) | ConvertTo-Json -Compress
+    $actions = @(@{ Type = "forward"; TargetGroupArn = $TgBackendArn }) | ConvertTo-Json -Compress
     aws elbv2 create-rule --listener-arn $ListenerArn --priority 10 --conditions $conditions --actions $actions | Out-Null
   }
 }
@@ -267,68 +287,66 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($descClustersJson)) {
 $OwnerLower = $GitHubOwner.ToLower()
 $RepoLower = $GitHubRepo.ToLower()
 $FrontendImage = "ghcr.io/$OwnerLower/$RepoLower-frontend:latest"
-$BackendImage  = "ghcr.io/$OwnerLower/$RepoLower-backend:latest"
+$BackendImage = "ghcr.io/$OwnerLower/$RepoLower-backend:latest"
 
 $RepoCredsBlock = $null
 if ($UsePrivateGhcr -match '^(Y|y)' -and $RepoCredsSecretArn) {
   $RepoCredsBlock = @{ credentialsParameter = $RepoCredsSecretArn }
 }
 
-$TdFrontend = @{
-  family = "$BaseName-frontend"
-  networkMode = "awsvpc"
-  requiresCompatibilities = @("FARGATE")
-  cpu = "512"
-  memory = "1024"
-  executionRoleArn = $TaskExecRoleArn
-  containerDefinitions = @(@{
-    name = "frontend"
-    image = $FrontendImage
-    portMappings = @(@{ containerPort = 80; protocol = "tcp" })
-    logConfiguration = @{
-      logDriver = "awslogs"
-      options = @{
-        "awslogs-group" = $LgFrontend
-        "awslogs-region" = $AwsRegion
-        "awslogs-stream-prefix" = "ecs"
-      }
-    }
-    repositoryCredentials = $RepoCredsBlock
-  })
-} | ConvertTo-Json -Depth 20
+# --- Build container defs without null repositoryCredentials ---
+$containerFrontend = @{
+  name             = "frontend"
+  image            = $FrontendImage
+  portMappings     = @(@{ containerPort = 80; protocol = "tcp" })
+  logConfiguration = @{
+    logDriver = "awslogs"
+    options   = @{ "awslogs-group" = $LgFrontend; "awslogs-region" = $AwsRegion; "awslogs-stream-prefix" = "ecs" }
+  }
+}
+if ($RepoCredsSecretArn) { $containerFrontend.repositoryCredentials = @{ credentialsParameter = $RepoCredsSecretArn } }
 
-$TdBackend = @{
-  family = "$BaseName-backend"
-  networkMode = "awsvpc"
+$TdFrontendObj = @{
+  family                  = "$BaseName-frontend"
+  networkMode             = "awsvpc"
   requiresCompatibilities = @("FARGATE")
-  cpu = "512"
-  memory = "1024"
-  executionRoleArn = $TaskExecRoleArn
-  containerDefinitions = @(@{
-    name = "backend"
-    image = $BackendImage
-    portMappings = @(@{ containerPort = 5000; protocol = "tcp" })
-    logConfiguration = @{
-      logDriver = "awslogs"
-      options = @{
-        "awslogs-group" = $LgBackend
-        "awslogs-region" = $AwsRegion
-        "awslogs-stream-prefix" = "ecs"
-      }
-    }
-    repositoryCredentials = $RepoCredsBlock
-    environment = @(@{ name = "NODE_ENV"; value = "production" })
-  })
-} | ConvertTo-Json -Depth 20
-
+  cpu                     = "512"
+  memory                  = "1024"
+  executionRoleArn        = $TaskExecRoleArn
+  containerDefinitions    = @($containerFrontend)
+}
+$TdFrontend = $TdFrontendObj | ConvertTo-Json -Depth 20
 aws ecs register-task-definition --cli-input-json $TdFrontend | Out-Null
-aws ecs register-task-definition --cli-input-json $TdBackend  | Out-Null
+
+$containerBackend = @{
+  name             = "backend"
+  image            = $BackendImage
+  portMappings     = @(@{ containerPort = 5000; protocol = "tcp" })
+  logConfiguration = @{
+    logDriver = "awslogs"
+    options   = @{ "awslogs-group" = $LgBackend; "awslogs-region" = $AwsRegion; "awslogs-stream-prefix" = "ecs" }
+  }
+  environment      = @(@{ name = "NODE_ENV"; value = "production" })
+}
+if ($RepoCredsSecretArn) { $containerBackend.repositoryCredentials = @{ credentialsParameter = $RepoCredsSecretArn } }
+
+$TdBackendObj = @{
+  family                  = "$BaseName-backend"
+  networkMode             = "awsvpc"
+  requiresCompatibilities = @("FARGATE")
+  cpu                     = "512"
+  memory                  = "1024"
+  executionRoleArn        = $TaskExecRoleArn
+  containerDefinitions    = @($containerBackend)
+}
+$TdBackend = $TdBackendObj | ConvertTo-Json -Depth 20
+aws ecs register-task-definition --cli-input-json $TdBackend | Out-Null
 
 # -------- ECS Services --------
 $SvcFrontendName = "$BaseName-frontend"
-$SvcBackendName  = "$BaseName-backend"
+$SvcBackendName = "$BaseName-backend"
 
-$netCfgJson = @{ awsvpcConfiguration = @{ subnets = @($SubnetA,$SubnetB); securityGroups = @($SvcSgId); assignPublicIp = "ENABLED" } } | ConvertTo-Json -Compress
+$netCfgJson = @{ awsvpcConfiguration = @{ subnets = @($SubnetA, $SubnetB); securityGroups = @($SvcSgId); assignPublicIp = "ENABLED" } } | ConvertTo-Json -Compress
 
 function Service-Exists {
   param([string]$Name)
@@ -336,31 +354,60 @@ function Service-Exists {
   return ($ls.serviceArns -join " ") -match $Name
 }
 
+function Ensure-ServiceLinkedRole {
+  param([string]$ServiceName, [string]$ExpectedRoleName)
+  $has = aws iam list-roles --query "Roles[?RoleName=='$ExpectedRoleName'].RoleName" --output text 2>$null
+  if (-not $has) {
+    try {
+      aws iam create-service-linked-role --aws-service-name $ServiceName | Out-Null
+      Start-Sleep -Seconds 20
+    }
+    catch {
+      Write-Warning "Could not create service-linked role $ExpectedRoleName for $ServiceName $($_.Exception.Message)"
+    }
+  }
+}
+
+Ensure-ServiceLinkedRole -ServiceName "ecs.amazonaws.com" -ExpectedRoleName "AWSServiceRoleForECS"
+Ensure-ServiceLinkedRole -ServiceName "elasticloadbalancing.amazonaws.com" -ExpectedRoleName "AWSServiceRoleForElasticLoadBalancing"
+Ensure-ServiceLinkedRole -ServiceName "ecs.application-autoscaling.amazonaws.com" -ExpectedRoleName "AWSServiceRoleForApplicationAutoScaling_ECSService"
+
 if ($UseAlb) {
+  # --- Ensure cluster exists ---
+  $ClusterExists = (aws ecs describe-clusters --clusters $ClusterName --query "clusters[?status=='ACTIVE'].clusterName" --output text 2>$null)
+  if (-not $ClusterExists) {
+    aws ecs create-cluster --cluster-name $ClusterName | Out-Null
+  }
+
   $lbFrontend = (@(@{ targetGroupArn = $TgFrontendArn; containerName = "frontend"; containerPort = 80 })) | ConvertTo-Json -Compress
-  $lbBackend  = (@(@{ targetGroupArn = $TgBackendArn;  containerName = "backend";  containerPort = 5000 })) | ConvertTo-Json -Compress
+  $lbBackend = (@(@{ targetGroupArn = $TgBackendArn; containerName = "backend"; containerPort = 5000 })) | ConvertTo-Json -Compress
 
   if (Service-Exists -Name $SvcFrontendName) {
     aws ecs update-service --cluster $ClusterName --service $SvcFrontendName --task-definition "$BaseName-frontend" | Out-Null
-  } else {
+  }
+  else {
     aws ecs create-service --cluster $ClusterName --service-name $SvcFrontendName --task-definition "$BaseName-frontend" --desired-count 1 --launch-type FARGATE --network-configuration $netCfgJson --load-balancers $lbFrontend | Out-Null
   }
 
   if (Service-Exists -Name $SvcBackendName) {
     aws ecs update-service --cluster $ClusterName --service $SvcBackendName --task-definition "$BaseName-backend" | Out-Null
-  } else {
+  }
+  else {
     aws ecs create-service --cluster $ClusterName --service-name $SvcBackendName --task-definition "$BaseName-backend" --desired-count 1 --launch-type FARGATE --network-configuration $netCfgJson --load-balancers $lbBackend | Out-Null
   }
-} else {
+}
+else {
   # No-ALB fallback: services with public IPs, no load balancer
   if (Service-Exists -Name $SvcFrontendName) {
     aws ecs update-service --cluster $ClusterName --service $SvcFrontendName --task-definition "$BaseName-frontend" | Out-Null
-  } else {
+  }
+  else {
     aws ecs create-service --cluster $ClusterName --service-name $SvcFrontendName --task-definition "$BaseName-frontend" --desired-count 1 --launch-type FARGATE --network-configuration $netCfgJson | Out-Null
   }
   if (Service-Exists -Name $SvcBackendName) {
     aws ecs update-service --cluster $ClusterName --service $SvcBackendName --task-definition "$BaseName-backend" | Out-Null
-  } else {
+  }
+  else {
     aws ecs create-service --cluster $ClusterName --service-name $SvcBackendName --task-definition "$BaseName-backend" --desired-count 1 --launch-type FARGATE --network-configuration $netCfgJson | Out-Null
   }
 }
@@ -371,7 +418,8 @@ Write-Host "Setup complete."
 if ($UseAlb) {
   Write-Host "ALB DNS: http://$AlbDns"
   Write-Host "REACT_APP_API_URL suggestion: http://$AlbDns/api"
-} else {
+}
+else {
   Write-Host "ALB not created (not permitted). Services are running with public IPs."
   Write-Host "Get current backend public IP with:"
   Write-Host "  aws ecs list-tasks --cluster $ClusterName --service-name $SvcBackendName --query 'taskArns[0]' --output text | ForEach-Object {"

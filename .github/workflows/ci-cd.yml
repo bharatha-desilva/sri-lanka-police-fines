@@ -209,6 +209,36 @@ jobs:
             --service ${{ secrets.ECS_SERVICE_NAME }}-frontend \
             --force-new-deployment
 
+      - name: Debug ECS service
+        run: |
+          set -e
+          CL=${{ secrets.ECS_CLUSTER_NAME }}
+          BASE=${{ secrets.ECS_SERVICE_NAME }}
+
+          for SVC in backend frontend; do
+            echo "=== Describe service: $BASE-$SVC ==="
+            aws ecs describe-services --cluster "$CL" --services "$BASE-$SVC" | jq '.services[0] | {status, desiredCount, runningCount, pendingCount}'
+            echo "=== Recent events: $BASE-$SVC ==="
+            aws ecs describe-services --cluster "$CL" --services "$BASE-$SVC" --query 'services[0].events[0:10].[createdAt,message]' --output table || true
+
+            RUN=$(aws ecs list-tasks --cluster "$CL" --service-name "$BASE-$SVC" --desired-status RUNNING --query 'taskArns' --output text || true)
+            STOP=$(aws ecs list-tasks --cluster "$CL" --service-name "$BASE-$SVC" --desired-status STOPPED --query 'taskArns' --output text || true)
+
+            if [ -n "$RUN" ]; then
+              echo "=== Describe RUNNING task ==="
+              aws ecs describe-tasks --cluster "$CL" --tasks $RUN --query 'tasks[0].[lastStatus,containers[0].lastStatus,containers[0].networkBindings,containers[0].reason]' --output table || true
+            fi
+            if [ -n "$STOP" ]; then
+              echo "=== Describe STOPPED task ==="
+              aws ecs describe-tasks --cluster "$CL" --tasks $STOP --query 'tasks[0].[stoppedReason,containers[0].exitCode,containers[0].reason,containers[0].lastStatus]' --output table || true
+            fi
+          done
+
+          echo "=== Recent backend logs (if log group exists) ==="
+          aws logs filter-log-events --log-group-name "/ecs/${BASE}-backend" --max-items 100 --query 'events[].message' --output text || true
+          echo "=== Recent frontend logs (if log group exists) ==="
+          aws logs filter-log-events --log-group-name "/ecs/${BASE}-frontend" --max-items 100 --query 'events[].message' --output text || true
+
       - name: Wait for deployment
         run: |
           aws ecs wait services-stable \
