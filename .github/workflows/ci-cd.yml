@@ -95,6 +95,7 @@ jobs:
           cd client
           npm run build
         env:
+          CI: ""
           REACT_APP_API_URL: http://localhost:5000
           REACT_APP_STRIPE_PUBLISHABLE_KEY: pk_test_dummy
           REACT_APP_GOOGLE_MAPS_API_KEY: dummy_key
